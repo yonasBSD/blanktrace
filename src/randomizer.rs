@@ -1,5 +1,5 @@
 // src/randomizer.rs
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 
 /// Handles randomization of browser fingerprints (User-Agent, Accept-Language).
 pub struct Randomizer {
@@ -29,7 +29,7 @@ impl Randomizer {
     ///
     /// * `cfg` - Fingerprint configuration.
     pub fn new(cfg: &crate::config::FingerprintConfig) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let ua = rand_agents::user_agent().to_string();
         let lang = cfg
             .accept_languages
@@ -61,7 +61,7 @@ impl Randomizer {
     ///
     /// Returns the new Accept-Language string.
     pub fn rotate_accept_language(&mut self) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         self.current_lang = self
             .languages
             .choose(&mut rng)
@@ -104,8 +104,8 @@ mod tests {
         let mut randomizer = Randomizer::new(&cfg);
         let _ua1 = randomizer.current_ua.clone();
         let ua2 = randomizer.rotate_user_agent();
-        
-        // It's statistically possible but unlikely they are the same, 
+
+        // It's statistically possible but unlikely they are the same,
         // but rand_agents has a large pool.
         assert!(!ua2.is_empty());
         // We can't strictly assert inequality because of randomness, but we can check format.

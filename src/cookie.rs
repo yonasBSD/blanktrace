@@ -1,6 +1,7 @@
 // src/cookie.rs
 use crate::config::Config;
-use hyper::{Body, Request, Response};
+use hudsucker::Body;
+use hyper::{Request, Response};
 
 /// Handles cookie stripping logic based on configuration.
 #[derive(Clone)]

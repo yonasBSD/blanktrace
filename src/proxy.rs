@@ -1,9 +1,11 @@
 use crate::{blocker::Blocker, cookie::CookieHandler, db::LogEvent, randomizer::Randomizer};
 use hudsucker::{
-    start_proxy, CertificateAuthority, HttpContext, HttpHandler, NoopMessageHandler, ProxyConfig,
-    RequestOrResponse,
+    certificate_authority::RcgenAuthority,
+    rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose},
+    rustls::crypto::aws_lc_rs,
+    Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
-use hyper::{Body, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use log::info;
 use std::sync::Arc;
 use tokio::sync::{mpsc::Sender, Mutex};
@@ -28,7 +30,6 @@ pub struct PrivacyHandler {
     pub state: ProxyState,
 }
 
-#[async_trait::async_trait]
 impl HttpHandler for PrivacyHandler {
     async fn handle_request(
         &mut self,
@@ -162,7 +163,7 @@ impl HttpHandler for PrivacyHandler {
 }
 
 /// Generates or loads the Certificate Authority for HTTPS interception.
-fn generate_ca() -> anyhow::Result<CertificateAuthority> {
+fn generate_ca() -> anyhow::Result<RcgenAuthority> {
     let cert_path = "ca_cert.pem";
     let key_path = "ca_key.pem";
 
@@ -173,38 +174,27 @@ fn generate_ca() -> anyhow::Result<CertificateAuthority> {
         let cert_pem = std::fs::read_to_string(cert_path)?;
         let key_pem = std::fs::read_to_string(key_path)?;
 
-        // Parse PEM to DER
-        let cert_der = pem::parse(&cert_pem)?.into_contents();
-        let key_der = pem::parse(&key_pem)?.into_contents();
+        let key_pair = KeyPair::from_pem(&key_pem)?;
+        let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)?;
 
-        let private_key = hudsucker::rustls::PrivateKey(key_der);
-        let ca_cert = hudsucker::rustls::Certificate(cert_der);
-
-        return Ok(CertificateAuthority::new(private_key, ca_cert, 1000)?);
+        return Ok(RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider()));
     }
 
     // Generate new CA certificate
     info!("Generating new CA certificate");
-    let mut params = rcgen::CertificateParams::new(vec!["BlankTrace CA".to_string()]);
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let mut params = CertificateParams::new(vec![])?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
     ];
 
-    let key_pair = rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    params.key_pair = Some(key_pair);
-
-    let cert = rcgen::Certificate::from_params(params)?;
-    let cert_der = cert.serialize_der()?;
-    let key_der = cert.serialize_private_key_der();
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
 
     // Save to disk as PEM
-    let cert_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_der.clone()));
-    let key_pem = pem::encode(&pem::Pem::new("PRIVATE KEY", key_der.clone()));
-
-    std::fs::write(cert_path, cert_pem)?;
-    std::fs::write(key_path, key_pem)?;
+    std::fs::write(cert_path, cert.pem())?;
+    std::fs::write(key_path, key_pair.serialize_pem())?;
 
     info!("CA certificate saved to {} and {}", cert_path, key_path);
     info!(
@@ -212,10 +202,8 @@ fn generate_ca() -> anyhow::Result<CertificateAuthority> {
         cert_path
     );
 
-    let private_key = hudsucker::rustls::PrivateKey(key_der);
-    let ca_cert = hudsucker::rustls::Certificate(cert_der);
-
-    Ok(CertificateAuthority::new(private_key, ca_cert, 1000)?)
+    let issuer = Issuer::new(params, key_pair);
+    Ok(RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider()))
 }
 
 /// Starts the proxy server.
@@ -235,26 +223,23 @@ pub async fn run_proxy(state: ProxyState, port: u16) -> anyhow::Result<()> {
     // Create handler
     let handler = PrivacyHandler { state };
 
-    // Create proxy configuration
-    let config = ProxyConfig {
-        listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        shutdown_signal: Box::pin(async {
+    let proxy = Proxy::builder()
+        .with_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .with_ca(ca)
+        .with_rustls_connector(aws_lc_rs::default_provider())
+        .with_http_handler(handler)
+        .with_graceful_shutdown(async {
             tokio::signal::ctrl_c()
                 .await
                 .expect("Failed to install CTRL+C signal handler");
-        }),
-        ca,
-        http_handler: handler,
-        incoming_message_handler: NoopMessageHandler::new(),
-        outgoing_message_handler: NoopMessageHandler::new(),
-        upstream_proxy: None,
-    };
+        })
+        .build()?;
 
     info!("Privacy proxy listening on 127.0.0.1:{}", port);
     info!("Configure your browser to use this proxy for HTTP/HTTPS traffic");
     info!("Press Ctrl+C to stop the proxy");
 
-    start_proxy(config).await?;
+    proxy.start().await?;
 
     Ok(())
 }
